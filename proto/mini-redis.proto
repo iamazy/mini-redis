@@ -1,0 +1,29 @@
+syntax = "proto3";
+
+package mini_redis;
+
+message GetRequest {
+  string key = 1;
+}
+
+message GetResponse {
+  bool ok = 1;
+  string key = 2;
+  string value = 3;
+}
+
+
+message RaftMessage {
+  string data = 1;
+  string error = 2;
+}
+
+service MiniRedisService {
+
+  rpc Write(RaftMessage) returns (RaftMessage) {}
+  rpc Get(RaftMessage) returns (RaftMessage) {}
+
+  rpc AppendEntries(RaftMessage) returns (RaftMessage);
+  rpc InstallSnapshot(RaftMessage) returns (RaftMessage);
+  rpc Vote(RaftMessage) returns (RaftMessage);
+}

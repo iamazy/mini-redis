@@ -30,7 +30,21 @@ tokio-stream = "0.1"
 tracing = "0.1.13"
 tracing-futures = { version = "0.2.3" }
 tracing-subscriber = "0.2.2"
+serde = { version = "1.0", features = ["derive"] }
+serde_derive = "1"
+serde_bytes = "0.11"
+serde_json = "1"
+thiserror = "1"
+async-raft = { git = "https://github.com/async-raft/async-raft", branch = "master"}
+anyhow = "1"
+async-trait = "0.1"
+prost = "0.7"
+tonic = "0.4"
+chrono = "0.4"
 
 [dev-dependencies]
 # Enable test-utilities in dev mode only. This is mostly for tests.
 tokio = { version = "1", features = ["test-util"] }
+
+[build-dependencies]
+tonic-build = "0.4"
