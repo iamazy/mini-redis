@@ -1,92 +1,106 @@
-use serde_derive::{Deserialize, Serialize};
-use tokio::time::Duration;
-use async_raft::{NodeId, AppData, AppDataResponse, RaftStorage};
-use std::fmt::{self, Display, Formatter};
-use std::sync::Arc;
-use async_raft::storage::{CurrentSnapshotData, HardState, InitialState};
-use std::io::Cursor;
-use async_raft::raft::{EntryPayload, MembershipConfig, Entry};
-use tokio::sync::{RwLockReadGuard, RwLockWriteGuard, RwLock};
-use std::collections::{BTreeMap, HashMap};
-use anyhow::Result;
 use crate::db::Db;
-use bytes::Bytes;
-use thiserror::Error;
+use crate::protobuf::mini_redis::mini_redis_service_client::MiniRedisServiceClient;
+use crate::protobuf::mini_redis::mini_redis_service_server::{
+    MiniRedisService, MiniRedisServiceServer,
+};
+use crate::protobuf::mini_redis::{GetRequest, GetResponse, RaftMessage};
+use anyhow::Result;
+use async_raft::raft::{
+    AppendEntriesRequest, AppendEntriesResponse, ClientWriteRequest, Entry, EntryPayload,
+    InstallSnapshotRequest, InstallSnapshotResponse, MembershipConfig, VoteRequest, VoteResponse,
+};
+use async_raft::storage::{CurrentSnapshotData, HardState, InitialState};
+use async_raft::{
+    AppData, AppDataResponse, ClientWriteError, Config, NodeId, Raft, RaftMetrics, RaftNetwork,
+    RaftStorage,
+};
 use async_trait::async_trait;
+use bytes::Bytes;
+use serde_derive::{Deserialize, Serialize};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::convert::{TryFrom, TryInto};
+use std::fmt::{self, Display, Formatter};
+use std::io::Cursor;
+use std::sync::Arc;
+use thiserror::Error;
+use tokio::sync::{watch, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use tokio::task::JoinHandle;
+use tonic::transport::Channel;
+
+const ERR_INCONSISTENT_LOG: &str =
+    "a query was received which was expecting data to be in place which does not exist in the log";
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct Context {
-    pub db: Arc<Db>,
-    pub nodes: HashMap<NodeId, Node>
+    #[serde(skip)]
+    pub(crate) db: Db,
+    pub nodes: HashMap<NodeId, Node>,
 }
 
 impl Context {
-
     #[tracing::instrument(level = "info", skip(self))]
     pub fn apply(&mut self, data: &ClientRequest) -> anyhow::Result<ClientResponse> {
         match data.cmd {
-            Cmd::AddEntry {ref key, ref value} => {
-                match self.db.get(key.as_str()) {
-                    Some(val) => {
-                        let prev = String::from_utf8(val.to_vec())?;
-                        Ok(ClientResponse::Value {
-                            prev: Some(prev),
-                            result: Some(String::from_utf8(value.clone())?)
-                        })
-                    },
-                    None => {
-                        self.db.set(key.clone(), Bytes::from(value.clone()), None);
-                        Ok(ClientResponse::Value {
-                            prev: None,
-                            result: Some(String::from_utf8(value.clone())?)
-                        })
-                    }
+            Cmd::AddEntry { ref key, ref value } => match self.db.get(key.as_str()) {
+                Some(val) => {
+                    let prev = String::from_utf8(val.to_vec())?;
+                    Ok(ClientResponse::Value {
+                        prev: Some(prev),
+                        result: Some(String::from_utf8(value.clone())?),
+                    })
+                }
+                None => {
+                    self.db.set(key.clone(), Bytes::from(value.clone()), None);
+                    Ok(ClientResponse::Value {
+                        prev: None,
+                        result: Some(String::from_utf8(value.clone())?),
+                    })
                 }
             },
-            _ => Ok(ClientResponse::Value {prev: None, result: None}),
+            _ => Ok(ClientResponse::Value {
+                prev: None,
+                result: None,
+            }),
         }
     }
+
+    pub fn get_node(&self, node_id: &NodeId) -> Option<Node> {
+        let x = self.nodes.get(node_id);
+        x.cloned()
+    }
 }
-
-
 
 #[derive(Serialize, Deserialize, Debug, Default, Clone, PartialEq)]
 pub struct Node {
     pub name: String,
-    pub address: String
+    pub address: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Cmd {
-    AddEntry {
-        key: String,
-        value: Vec<u8>
-    },
-    RemoveEntry {
-        key: String
-    },
-    AddNode {
-        node_id: NodeId,
-        node: Node
-    },
-    RemoveNode {
-        node_id: NodeId
-    }
+    AddEntry { key: String, value: Vec<u8> },
+    RemoveEntry { key: String },
+    AddNode { node_id: NodeId, node: Node },
+    RemoveNode { node_id: NodeId },
 }
 
 impl Display for Cmd {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
-            Cmd::AddEntry { key, value} => {
+            Cmd::AddEntry { key, value } => {
                 write!(f, "add entry: key = {}", key)
             }
-            Cmd::RemoveEntry { key} => {
+            Cmd::RemoveEntry { key } => {
                 write!(f, "remove entry: key = {}", key)
             }
-            Cmd::AddNode { node_id, node} => {
-                write!(f, "add node [id: {}, name: {}, address: {}]", node_id, node.name, node.address)
+            Cmd::AddNode { node_id, node } => {
+                write!(
+                    f,
+                    "add node [id: {}, name: {}, address: {}]",
+                    node_id, node.name, node.address
+                )
             }
-            Cmd::RemoveNode { node_id} => {
+            Cmd::RemoveNode { node_id } => {
                 write!(f, "remove node [id: {}]", node_id)
             }
         }
@@ -96,14 +110,14 @@ impl Display for Cmd {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct RaftTxId {
     pub client_id: String,
-    pub serial: u64
+    pub serial: u64,
 }
 
 impl RaftTxId {
     pub fn new(client_id: &str, serial: u64) -> Self {
         Self {
             client_id: client_id.to_string(),
-            serial
+            serial,
         }
     }
 }
@@ -111,24 +125,128 @@ impl RaftTxId {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ClientRequest {
     pub tx_id: Option<RaftTxId>,
-    pub cmd: Cmd
+    pub cmd: Cmd,
 }
 
 impl AppData for ClientRequest {}
+
+impl tonic::IntoRequest<RaftMessage> for ClientRequest {
+    fn into_request(self) -> tonic::Request<RaftMessage> {
+        let mes = RaftMessage {
+            data: serde_json::to_string(&self).expect("fail to serialize"),
+            error: "".to_string(),
+        };
+        tonic::Request::new(mes)
+    }
+}
+impl tonic::IntoRequest<RaftMessage> for AppendEntriesRequest<ClientRequest> {
+    fn into_request(self) -> tonic::Request<RaftMessage> {
+        let mes = RaftMessage {
+            data: serde_json::to_string(&self).expect("fail to serialize"),
+            error: "".to_string(),
+        };
+        tonic::Request::new(mes)
+    }
+}
+impl tonic::IntoRequest<RaftMessage> for InstallSnapshotRequest {
+    fn into_request(self) -> tonic::Request<RaftMessage> {
+        let mes = RaftMessage {
+            data: serde_json::to_string(&self).expect("fail to serialize"),
+            error: "".to_string(),
+        };
+        tonic::Request::new(mes)
+    }
+}
+impl tonic::IntoRequest<RaftMessage> for VoteRequest {
+    fn into_request(self) -> tonic::Request<RaftMessage> {
+        let mes = RaftMessage {
+            data: serde_json::to_string(&self).expect("fail to serialize"),
+            error: "".to_string(),
+        };
+        tonic::Request::new(mes)
+    }
+}
+
+impl TryFrom<RaftMessage> for ClientRequest {
+    type Error = tonic::Status;
+
+    fn try_from(mes: RaftMessage) -> Result<Self, Self::Error> {
+        let req: ClientRequest =
+            serde_json::from_str(&mes.data).map_err(|e| tonic::Status::internal(e.to_string()))?;
+        Ok(req)
+    }
+}
+
+#[derive(Error, Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub enum RetryableError {
+    #[error("request must be forwarded to leader: {leader}")]
+    ForwardToLeader { leader: NodeId },
+}
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum ClientResponse {
     Value {
         prev: Option<String>,
-        result: Option<String>
+        result: Option<String>,
     },
     Node {
         prev: Option<Node>,
-        result: Option<Node>
-    }
+        result: Option<Node>,
+    },
 }
 
 impl AppDataResponse for ClientResponse {}
+
+impl From<ClientResponse> for RaftMessage {
+    fn from(msg: ClientResponse) -> Self {
+        let data = serde_json::to_string(&msg).expect("fail to serialize");
+        RaftMessage {
+            data,
+            error: "".to_string(),
+        }
+    }
+}
+impl From<RetryableError> for RaftMessage {
+    fn from(err: RetryableError) -> Self {
+        let error = serde_json::to_string(&err).expect("fail to serialize");
+        RaftMessage {
+            data: "".to_string(),
+            error,
+        }
+    }
+}
+
+impl From<Result<ClientResponse, RetryableError>> for RaftMessage {
+    fn from(rst: Result<ClientResponse, RetryableError>) -> Self {
+        match rst {
+            Ok(resp) => resp.into(),
+            Err(err) => err.into(),
+        }
+    }
+}
+
+impl From<RaftMessage> for Result<ClientResponse, RetryableError> {
+    fn from(msg: RaftMessage) -> Self {
+        if !msg.data.is_empty() {
+            let resp: ClientResponse =
+                serde_json::from_str(&msg.data).expect("fail to deserialize");
+            Ok(resp)
+        } else {
+            let err: RetryableError =
+                serde_json::from_str(&msg.error).expect("fail to deserialize");
+            Err(err)
+        }
+    }
+}
+
+impl From<(Option<Node>, Option<Node>)> for ClientResponse {
+    fn from(v: (Option<Node>, Option<Node>)) -> Self {
+        ClientResponse::Node {
+            prev: v.0,
+            result: v.1,
+        }
+    }
+}
 
 /// RaftStorage
 
@@ -146,7 +264,7 @@ pub struct MemStoreSnapshot {
     pub index: u64,
     /// The term of the last index covered by this snapshot.
     pub term: u64,
-    /// The last memberhsip config included in this snapshot.
+    /// The last membership config included in this snapshot.
     pub membership: MembershipConfig,
     /// The data of the state machine at the time of this snapshot.
     pub data: Vec<u8>,
@@ -158,17 +276,17 @@ pub struct MemStoreStateMachine {
     pub last_applied_log: u64,
     /// A mapping of client IDs to their state info.
     pub client_serial_responses: HashMap<String, (u64, ClientResponse)>,
-    pub context: Context
+    pub context: Context,
 }
 
 impl MemStoreStateMachine {
-
     #[tracing::instrument(level = "info", skip(self))]
     pub fn apply(&mut self, index: u64, data: &ClientRequest) -> anyhow::Result<ClientResponse> {
         self.last_applied_log = index;
         if let Some(ref tx_id) = data.tx_id {
             if let Some(ref tx_id) = data.tx_id {
-                if let Some((serial, response)) = self.client_serial_responses.get(&tx_id.client_id) {
+                if let Some((serial, response)) = self.client_serial_responses.get(&tx_id.client_id)
+                {
                     if serial == &tx_id.serial {
                         return Ok(response.clone());
                     }
@@ -177,7 +295,8 @@ impl MemStoreStateMachine {
         }
         let resp = self.context.apply(data)?;
         if let Some(ref tx_id) = data.tx_id {
-            self.client_serial_responses.insert(tx_id.client_id.clone(), (tx_id.serial, resp.clone()));
+            self.client_serial_responses
+                .insert(tx_id.client_id.clone(), (tx_id.serial, resp.clone()));
         }
         Ok(resp)
     }
@@ -216,7 +335,10 @@ impl MemStore {
     /// Create a new `MemStore` instance with some existing state (for testing).
     #[cfg(test)]
     pub fn new_with_state(
-        id: NodeId, log: BTreeMap<u64, Entry<ClientRequest>>, sm: MemStoreStateMachine, hs: Option<HardState>,
+        id: NodeId,
+        log: BTreeMap<u64, Entry<ClientRequest>>,
+        sm: MemStoreStateMachine,
+        hs: Option<HardState>,
         current_snapshot: Option<MemStoreSnapshot>,
     ) -> Self {
         let log = RwLock::new(log);
@@ -245,6 +367,37 @@ impl MemStore {
     /// Get a handle to the current hard state for testing purposes.
     pub async fn read_hard_state(&self) -> RwLockReadGuard<'_, Option<HardState>> {
         self.hs.read().await
+    }
+}
+
+impl MemStore {
+    pub async fn get_node(&self, node_id: &NodeId) -> Option<Node> {
+        let sm = self.sm.read().await;
+        sm.context.get_node(node_id)
+    }
+
+    pub async fn get_node_addr(&self, node_id: &NodeId) -> anyhow::Result<String> {
+        let addr = self
+            .get_node(node_id)
+            .await
+            .map(|n| n.address)
+            .ok_or_else(|| anyhow::anyhow!("node not found {}", node_id))?;
+        Ok(addr)
+    }
+
+    pub async fn list_non_voters(&self) -> HashSet<NodeId> {
+        let mut rst = HashSet::new();
+        let sm = self.sm.read().await;
+        let ms = self
+            .get_membership_config()
+            .await
+            .expect("fail to get membership");
+        for i in sm.context.nodes.keys() {
+            if !ms.contains(i) {
+                rst.insert(*i);
+            }
+        }
+        rst
     }
 }
 
@@ -350,7 +503,11 @@ impl RaftStorage<ClientRequest, ClientResponse> for MemStore {
     }
 
     #[tracing::instrument(level = "trace", skip(self, data))]
-    async fn apply_entry_to_state_machine(&self, index: &u64, data: &ClientRequest) -> Result<ClientResponse> {
+    async fn apply_entry_to_state_machine(
+        &self,
+        index: &u64,
+        data: &ClientRequest,
+    ) -> Result<ClientResponse> {
         let mut sm = self.sm.write().await;
         let resp = sm.apply(*index, data)?;
         Ok(resp)
@@ -402,7 +559,12 @@ impl RaftStorage<ClientRequest, ClientResponse> for MemStore {
             *log = log.split_off(&last_applied_log);
             log.insert(
                 last_applied_log,
-                Entry::new_snapshot_pointer(last_applied_log, term, "".into(), membership_config.clone()),
+                Entry::new_snapshot_pointer(
+                    last_applied_log,
+                    term,
+                    "".into(),
+                    membership_config.clone(),
+                ),
             );
 
             let snapshot = MemStoreSnapshot {
@@ -415,7 +577,10 @@ impl RaftStorage<ClientRequest, ClientResponse> for MemStore {
             *current_snapshot = Some(snapshot);
         } // Release log & snapshot write locks.
 
-        tracing::trace!({ snapshot_size = snapshot_bytes.len() }, "log compaction complete");
+        tracing::trace!(
+            { snapshot_size = snapshot_bytes.len() },
+            "log compaction complete"
+        );
         Ok(CurrentSnapshotData {
             term,
             index: last_applied_log,
@@ -431,9 +596,17 @@ impl RaftStorage<ClientRequest, ClientResponse> for MemStore {
 
     #[tracing::instrument(level = "trace", skip(self, snapshot))]
     async fn finalize_snapshot_installation(
-        &self, index: u64, term: u64, delete_through: Option<u64>, id: String, snapshot: Box<Self::Snapshot>,
+        &self,
+        index: u64,
+        term: u64,
+        delete_through: Option<u64>,
+        id: String,
+        snapshot: Box<Self::Snapshot>,
     ) -> Result<()> {
-        tracing::trace!({ snapshot_size = snapshot.get_ref().len() }, "decoding snapshot for installation");
+        tracing::trace!(
+            { snapshot_size = snapshot.get_ref().len() },
+            "decoding snapshot for installation"
+        );
         let raw = serde_json::to_string_pretty(snapshot.get_ref().as_slice())?;
         println!("JSON SNAP:\n{}", raw);
         let new_snapshot: MemStoreSnapshot = serde_json::from_slice(snapshot.get_ref().as_slice())?;
@@ -457,7 +630,10 @@ impl RaftStorage<ClientRequest, ClientResponse> for MemStore {
                 }
                 None => log.clear(),
             }
-            log.insert(index, Entry::new_snapshot_pointer(index, term, id, membership_config));
+            log.insert(
+                index,
+                Entry::new_snapshot_pointer(index, term, id, membership_config),
+            );
         }
 
         // Update the state machine.
@@ -491,7 +667,7 @@ impl RaftStorage<ClientRequest, ClientResponse> for MemStore {
 }
 
 pub struct Network {
-    sto: Arc<MemStore>
+    sto: Arc<MemStore>,
 }
 
 impl Network {
@@ -499,5 +675,617 @@ impl Network {
         Network { sto }
     }
 
-    // pub async fn make_client(&self, node_id: &NodeId) -> anyhow::Result<Meta>
+    #[tracing::instrument(level = "info", skip(self), fields(myid=self.sto.id))]
+    pub async fn make_client(
+        &self,
+        node_id: &NodeId,
+    ) -> anyhow::Result<MiniRedisServiceClient<Channel>> {
+        let addr = self.sto.get_node_addr(node_id).await?;
+        tracing::info!("connect: id = {}: {}", node_id, addr);
+        let client = MiniRedisServiceClient::connect(format!("http://{}", addr)).await?;
+        tracing::info!("connected: id = {}, {}", node_id, addr);
+        Ok(client)
+    }
+}
+
+#[async_trait]
+impl RaftNetwork<ClientRequest> for Network {
+    #[tracing::instrument(level = "info", skip(self), fields(myid=self.sto.id))]
+    async fn append_entries(
+        &self,
+        target: u64,
+        rpc: AppendEntriesRequest<ClientRequest>,
+    ) -> Result<AppendEntriesResponse> {
+        tracing::debug!("append_entries req to: id = {}: {:?}", target, rpc);
+        let mut client = self.make_client(&target).await?;
+        let resp = client.append_entries(rpc).await;
+        tracing::debug!("append_entries resp from: id = {}: {:?}", target, resp);
+
+        let resp = resp?;
+        let mes = resp.into_inner();
+        let resp = serde_json::from_str(&mes.data)?;
+        Ok(resp)
+    }
+
+    #[tracing::instrument(level = "info", skip(self), fields(myid=self.sto.id))]
+    async fn install_snapshot(
+        &self,
+        target: u64,
+        rpc: InstallSnapshotRequest,
+    ) -> Result<InstallSnapshotResponse> {
+        tracing::debug!("install_snapshot req to: id={}", target);
+
+        let mut client = self.make_client(&target).await?;
+        let resp = client.install_snapshot(rpc).await;
+        tracing::debug!("install_snapshot resp from: id={}: {:?}", target, resp);
+
+        let resp = resp?;
+        let mes = resp.into_inner();
+        let resp = serde_json::from_str(&mes.data)?;
+
+        Ok(resp)
+    }
+
+    #[tracing::instrument(level = "info", skip(self), fields(myid=self.sto.id))]
+    async fn vote(&self, target: u64, rpc: VoteRequest) -> Result<VoteResponse> {
+        tracing::debug!("vote req to: id={} {:?}", target, rpc);
+
+        let mut client = self.make_client(&target).await?;
+        let resp = client.vote(rpc).await;
+        tracing::info!("vote: resp from id={} {:?}", target, resp);
+
+        let resp = resp?;
+        let mes = resp.into_inner();
+        let resp = serde_json::from_str(&mes.data)?;
+
+        Ok(resp)
+    }
+}
+
+pub type MiniRedisRaft = Raft<ClientRequest, ClientResponse, Network, MemStore>;
+
+pub struct MiniRedisNode {
+    pub metrics_rx: watch::Receiver<RaftMetrics>,
+    pub sto: Arc<MemStore>,
+    pub raft: MiniRedisRaft,
+    pub running_tx: watch::Sender<()>,
+    pub running_rx: watch::Receiver<()>,
+    pub join_handles: Mutex<Vec<JoinHandle<anyhow::Result<()>>>>,
+}
+
+pub struct MiniRedisNodeBuilder {
+    node_id: Option<NodeId>,
+    config: Option<Config>,
+    sto: Option<Arc<MemStore>>,
+    monitor_metrics: bool,
+    start_grpc_service: bool,
+}
+
+impl MiniRedisNodeBuilder {
+    pub async fn build(mut self) -> anyhow::Result<Arc<MiniRedisNode>> {
+        let node_id = self
+            .node_id
+            .ok_or_else(|| anyhow::anyhow!("node_id is not set"))?;
+
+        let config = self
+            .config
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("config is not set"))?;
+
+        let sto = self
+            .sto
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("sto is not set"))?;
+
+        let net = Network::new(sto.clone());
+
+        let raft = MiniRedisRaft::new(node_id, Arc::new(config), Arc::new(net), sto.clone());
+        let metrics_rx = raft.metrics();
+
+        let (tx, rx) = watch::channel::<()>(());
+
+        let mn = Arc::new(MiniRedisNode {
+            metrics_rx: metrics_rx.clone(),
+            sto: sto.clone(),
+            raft,
+            running_tx: tx,
+            running_rx: rx,
+            join_handles: Mutex::new(Vec::new()),
+        });
+
+        if self.monitor_metrics {
+            tracing::info!("about to subscribe raft metrics");
+            MiniRedisNode::subscribe_metrics(mn.clone(), metrics_rx).await;
+        }
+
+        if self.start_grpc_service {
+            let addr = sto.get_node_addr(&node_id).await?;
+            tracing::info!("about to start grpc on {}", addr);
+            MiniRedisNode::start_grpc(mn.clone(), &addr).await?;
+        }
+        Ok(mn)
+    }
+
+    pub fn node_id(mut self, node_id: NodeId) -> Self {
+        self.node_id = Some(node_id);
+        self
+    }
+    pub fn sto(mut self, sto: Arc<MemStore>) -> Self {
+        self.sto = Some(sto);
+        self
+    }
+    pub fn start_grpc_service(mut self, b: bool) -> Self {
+        self.start_grpc_service = b;
+        self
+    }
+    pub fn monitor_metrics(mut self, b: bool) -> Self {
+        self.monitor_metrics = b;
+        self
+    }
+}
+
+impl MiniRedisNode {
+    pub fn builder() -> MiniRedisNodeBuilder {
+        // Set heartbeat interval to a reasonable value.
+        // The election_timeout should tolerate several heartbeat loss.
+        let heartbeat = 500; // ms
+        MiniRedisNodeBuilder {
+            node_id: None,
+            config: Some(
+                Config::build("foo_cluster".into())
+                    .heartbeat_interval(heartbeat)
+                    .election_timeout_min(heartbeat * 4)
+                    .election_timeout_max(heartbeat * 8)
+                    .validate()
+                    .expect("fail to build raft config"),
+            ),
+            sto: None,
+            monitor_metrics: true,
+            start_grpc_service: true,
+        }
+    }
+
+    /// Start the grpc service for raft communication and meta operation API.
+    #[tracing::instrument(level = "info", skip(mn))]
+    pub async fn start_grpc(mn: Arc<MiniRedisNode>, addr: &str) -> anyhow::Result<()> {
+        let mut rx = mn.running_rx.clone();
+
+        let redis_srv_impl = MiniRedisServiceImpl::create(mn.clone());
+        let redis_srv = MiniRedisServiceServer::new(redis_srv_impl);
+
+        let addr_str = addr.to_string();
+        let addr = addr.parse::<std::net::SocketAddr>()?;
+        let node_id = mn.sto.id;
+
+        let srv = tonic::transport::Server::builder().add_service(redis_srv);
+
+        let h = tokio::spawn(async move {
+            srv.serve_with_shutdown(addr, async move {
+                let _ = rx.changed().await;
+                tracing::info!(
+                    "signal received, shutting down: id={} {} ",
+                    node_id,
+                    addr_str
+                );
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("MiniRedisNode service error: {:?}", e))?;
+            Ok::<(), anyhow::Error>(())
+        });
+
+        let mut jh = mn.join_handles.lock().await;
+        jh.push(h);
+        Ok(())
+    }
+
+    /// Start a MetaStore node from initialized store.
+    #[tracing::instrument(level = "info")]
+    pub async fn new(node_id: NodeId) -> Arc<MiniRedisNode> {
+        let b = MiniRedisNode::builder()
+            .node_id(node_id)
+            .sto(Arc::new(MemStore::new(node_id)));
+
+        b.build().await.expect("can not fail")
+    }
+
+    #[tracing::instrument(level = "info", skip(self))]
+    pub async fn stop(&self) -> anyhow::Result<i32> {
+        // TODO need to be reentrant.
+
+        let mut rx = self.raft.metrics();
+
+        self.raft.shutdown().await?;
+        self.running_tx.send(()).unwrap();
+
+        // wait for raft to close the metrics tx
+        loop {
+            let r = rx.changed().await;
+            if r.is_err() {
+                break;
+            }
+            tracing::info!("waiting for raft to shutdown, metrics: {:?}", rx.borrow());
+        }
+        tracing::info!("shutdown raft");
+
+        // raft counts 1
+        let mut joined = 1;
+        for j in self.join_handles.lock().await.iter_mut() {
+            let _rst = j.await?;
+            joined += 1;
+        }
+
+        tracing::info!("shutdown: myid={}", self.sto.id);
+        Ok(joined)
+    }
+
+    // spawn a monitor to watch raft state changes such as leader changes,
+    // and manually add non-voter to cluster so that non-voter receives raft logs.
+    pub async fn subscribe_metrics(mn: Arc<Self>, mut metrics_rx: watch::Receiver<RaftMetrics>) {
+        //TODO: return a handle for join
+        // TODO: every state change triggers add_non_voter!!!
+        let mut rx = mn.running_rx.clone();
+        let mut jh = mn.join_handles.lock().await;
+
+        // TODO: reduce dependency: it does not need all of the fields in MiniRedisNode
+        let mn = mn.clone();
+
+        let h = tokio::task::spawn(async move {
+            loop {
+                let changed = tokio::select! {
+                    _ = rx.changed() => {
+                       return Ok::<(), anyhow::Error>(());
+                    }
+                    changed = metrics_rx.changed() => {
+                        changed
+                    }
+                };
+                if changed.is_ok() {
+                    let mm = metrics_rx.borrow().clone();
+                    if let Some(cur) = mm.current_leader {
+                        if cur == mn.sto.id {
+                            // TODO: check result
+                            let _rst = mn.add_configured_non_voters().await;
+
+                            if _rst.is_err() {
+                                tracing::info!(
+                                    "fail to add non-voter: my id={}, rst:{:?}",
+                                    mn.sto.id,
+                                    _rst
+                                );
+                            }
+                        }
+                    }
+                } else {
+                    // shutting down
+                    break;
+                }
+            }
+
+            Ok::<(), anyhow::Error>(())
+        });
+        jh.push(h);
+    }
+
+    /// Boot up the first node to create a cluster.
+    /// For every cluster this func should be called exactly once.
+    /// When a node is initialized with boot or boot_non_voter, start it with MetaStore::new().
+    #[tracing::instrument(level = "info")]
+    pub async fn boot(node_id: NodeId, addr: String) -> anyhow::Result<Arc<MiniRedisNode>> {
+        let mn = MiniRedisNode::boot_non_voter(node_id, &addr).await?;
+
+        let mut cluster_node_ids = HashSet::new();
+        cluster_node_ids.insert(node_id);
+
+        let rst = mn
+            .raft
+            .initialize(cluster_node_ids)
+            .await
+            .map_err(|x| anyhow::anyhow!("{:?}", x))?;
+
+        tracing::info!("booted, rst: {:?}", rst);
+        mn.add_node(node_id, addr).await?;
+
+        Ok(mn)
+    }
+
+    /// Boot a node that is going to join an existent cluster.
+    /// For every node this should be called exactly once.
+    /// When successfully initialized(e.g. received logs from raft leader), a node should be started with MiniRedisNode::new().
+    #[tracing::instrument(level = "info")]
+    pub async fn boot_non_voter(node_id: NodeId, addr: &str) -> anyhow::Result<Arc<MiniRedisNode>> {
+        // TODO test MiniRedisNode::new() on a booted store.
+        // TODO: Before calling this func, the node should be added as a non-voter to leader.
+        // TODO: check raft initialState to see if the store is clean.
+
+        // When booting, there is addr stored in local store.
+        // Thus we need to start grpc manually.
+        let sto = MemStore::new(node_id);
+
+        let b = MiniRedisNode::builder()
+            .node_id(node_id)
+            .start_grpc_service(false)
+            .sto(Arc::new(sto));
+
+        let mn = b.build().await?;
+
+        // Manually start the grpc, since no addr is stored yet.
+        // We can not use the startup routine for initialized node.
+        MiniRedisNode::start_grpc(mn.clone(), addr).await?;
+
+        tracing::info!("booted non-voter: {}={}", node_id, addr);
+
+        Ok(mn)
+    }
+
+    /// When a leader is established, it is the leader's responsibility to setup replication from itself to non-voters, AKA learners.
+    /// async-raft does not persist the node set of non-voters, thus we need to do it manually.
+    /// This fn should be called once a node found it becomes leader.
+    #[tracing::instrument(level = "info", skip(self))]
+    pub async fn add_configured_non_voters(&self) -> anyhow::Result<()> {
+        // TODO after leader established, add non-voter through apis
+        let node_ids = self.sto.list_non_voters().await;
+        for i in node_ids.iter() {
+            let x = self.raft.add_non_voter(*i).await;
+
+            tracing::info!("add_non_voter result: {:?}", x);
+            if x.is_ok() {
+                tracing::info!("non-voter is added: {}", i);
+            } else {
+                tracing::info!("non-voter already exist: {}", i);
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn get(&self, key: &str) -> Option<String> {
+        let sm = self.sto.sm.read().await;
+        match sm.context.db.get(key) {
+            Some(bytes) => Some(String::from_utf8(bytes.to_vec()).unwrap()),
+            None => None,
+        }
+    }
+
+    #[tracing::instrument(level = "debug", skip(self))]
+    pub async fn get_node(&self, node_id: &NodeId) -> Option<Node> {
+        // inconsistent get: from local state machine
+
+        let sm = self.sto.sm.read().await;
+        sm.context.get_node(node_id)
+    }
+
+    /// Add a new node into this cluster.
+    /// The node info is committed with raft, thus it must be called on an initialized node.
+    #[tracing::instrument(level = "debug", skip(self))]
+    pub async fn add_node(&self, node_id: NodeId, addr: String) -> anyhow::Result<ClientResponse> {
+        // TODO: use tx_id?
+        let _resp = self
+            .write(ClientRequest {
+                tx_id: None,
+                cmd: Cmd::AddNode {
+                    node_id,
+                    node: Node {
+                        name: petname::petname(1, ""),
+                        address: addr,
+                    },
+                },
+            })
+            .await?;
+        Ok(_resp)
+    }
+
+    /// Submit a write request to the known leader. Returns the response after applying the request.
+    #[tracing::instrument(level = "info", skip(self))]
+    pub async fn write(&self, req: ClientRequest) -> anyhow::Result<ClientResponse> {
+        let mut curr_leader = self.get_leader().await;
+        loop {
+            let rst = if curr_leader == self.sto.id {
+                self.write_to_local_leader(req.clone()).await?
+            } else {
+                // forward to leader
+
+                let addr = self.sto.get_node_addr(&curr_leader).await?;
+                let mut client =
+                    MiniRedisServiceClient::connect(format!("http://{}", addr)).await?;
+                let resp = client.write(req.clone()).await?;
+                let rst: Result<ClientResponse, RetryableError> = resp.into_inner().into();
+                rst
+            };
+
+            match rst {
+                Ok(resp) => return Ok(resp),
+                Err(write_err) => match write_err {
+                    RetryableError::ForwardToLeader { leader } => curr_leader = leader,
+                },
+            }
+        }
+    }
+
+    /// Try to get the leader from the latest metrics of the local raft node.
+    /// If leader is absent, wait for an metrics update in which a leader is set.
+    #[tracing::instrument(level = "info", skip(self))]
+    pub async fn get_leader(&self) -> NodeId {
+        // fast path: there is a known leader
+
+        if let Some(l) = self.metrics_rx.borrow().current_leader {
+            return l;
+        }
+
+        // slow path: wait loop
+
+        // Need to clone before calling changed() on it.
+        // Otherwise other thread waiting on changed() may not receive the change event.
+        let mut rx = self.metrics_rx.clone();
+
+        loop {
+            // NOTE:
+            // The metrics may have already changed before we cloning it.
+            // Thus we need to re-check the cloned rx.
+            if let Some(l) = rx.borrow().current_leader {
+                return l;
+            }
+
+            let changed = rx.changed().await;
+            if changed.is_err() {
+                tracing::info!("raft metrics tx closed");
+                return 0;
+            }
+        }
+    }
+
+    /// Write a meta log through local raft node.
+    /// It works only when this node is the leader,
+    /// otherwise it returns ClientWriteError::ForwardToLeader error indicating the latest leader.
+    #[tracing::instrument(level = "info", skip(self))]
+    pub async fn write_to_local_leader(
+        &self,
+        req: ClientRequest,
+    ) -> anyhow::Result<Result<ClientResponse, RetryableError>> {
+        let write_rst = self.raft.client_write(ClientWriteRequest::new(req)).await;
+
+        tracing::debug!("raft.client_write rst: {:?}", write_rst);
+
+        match write_rst {
+            Ok(resp) => Ok(Ok(resp.data)),
+            Err(cli_write_err) => match cli_write_err {
+                // fatal error
+                ClientWriteError::RaftError(raft_err) => Err(anyhow::anyhow!(raft_err.to_string())),
+                // retryable error
+                ClientWriteError::ForwardToLeader(_, leader) => match leader {
+                    Some(id) => Ok(Err(RetryableError::ForwardToLeader { leader: id })),
+                    None => Err(anyhow::anyhow!("no leader to write")),
+                },
+            },
+        }
+    }
+}
+
+pub struct MiniRedisServiceImpl {
+    pub mini_redis_node: Arc<MiniRedisNode>,
+}
+
+impl MiniRedisServiceImpl {
+    pub fn create(mini_redis_node: Arc<MiniRedisNode>) -> Self {
+        Self { mini_redis_node }
+    }
+}
+
+#[async_trait::async_trait]
+impl MiniRedisService for MiniRedisServiceImpl {
+    /// Handles a write request.
+    /// This node must be leader or an error returned.
+    #[tracing::instrument(level = "info", skip(self))]
+    async fn write(
+        &self,
+        request: tonic::Request<RaftMessage>,
+    ) -> Result<tonic::Response<RaftMessage>, tonic::Status> {
+        let mes = request.into_inner();
+        let req: ClientRequest = mes.try_into()?;
+
+        let rst = self
+            .mini_redis_node
+            .write_to_local_leader(req)
+            .await
+            .map_err(|e| tonic::Status::internal(e.to_string()))?;
+
+        let raft_mes = rst.into();
+        Ok(tonic::Response::new(raft_mes))
+    }
+
+    #[tracing::instrument(level = "info", skip(self))]
+    async fn get(
+        &self,
+        request: tonic::Request<GetRequest>,
+    ) -> Result<tonic::Response<GetResponse>, tonic::Status> {
+        let req = request.into_inner();
+        let resp = self.mini_redis_node.get(&req.key).await;
+        let rst = match resp {
+            Some(v) => GetResponse {
+                ok: true,
+                key: req.key,
+                value: v,
+            },
+            None => GetResponse {
+                ok: false,
+                key: req.key,
+                value: "".into(),
+            },
+        };
+
+        Ok(tonic::Response::new(rst))
+    }
+
+    #[tracing::instrument(level = "info", skip(self))]
+    async fn append_entries(
+        &self,
+        request: tonic::Request<RaftMessage>,
+    ) -> Result<tonic::Response<RaftMessage>, tonic::Status> {
+        let req = request.into_inner();
+
+        let ae_req =
+            serde_json::from_str(&req.data).map_err(|x| tonic::Status::internal(x.to_string()))?;
+
+        let resp = self
+            .mini_redis_node
+            .raft
+            .append_entries(ae_req)
+            .await
+            .map_err(|x| tonic::Status::internal(x.to_string()))?;
+        let data = serde_json::to_string(&resp).expect("fail to serialize resp");
+        let mes = RaftMessage {
+            data,
+            error: "".to_string(),
+        };
+
+        Ok(tonic::Response::new(mes))
+    }
+
+    #[tracing::instrument(level = "info", skip(self))]
+    async fn install_snapshot(
+        &self,
+        request: tonic::Request<RaftMessage>,
+    ) -> Result<tonic::Response<RaftMessage>, tonic::Status> {
+        let req = request.into_inner();
+
+        let is_req =
+            serde_json::from_str(&req.data).map_err(|x| tonic::Status::internal(x.to_string()))?;
+
+        let resp = self
+            .mini_redis_node
+            .raft
+            .install_snapshot(is_req)
+            .await
+            .map_err(|x| tonic::Status::internal(x.to_string()))?;
+        let data = serde_json::to_string(&resp).expect("fail to serialize resp");
+        let mes = RaftMessage {
+            data,
+            error: "".to_string(),
+        };
+
+        Ok(tonic::Response::new(mes))
+    }
+
+    #[tracing::instrument(level = "info", skip(self))]
+    async fn vote(
+        &self,
+        request: tonic::Request<RaftMessage>,
+    ) -> Result<tonic::Response<RaftMessage>, tonic::Status> {
+        let req = request.into_inner();
+
+        let v_req =
+            serde_json::from_str(&req.data).map_err(|x| tonic::Status::internal(x.to_string()))?;
+
+        let resp = self
+            .mini_redis_node
+            .raft
+            .vote(v_req)
+            .await
+            .map_err(|x| tonic::Status::internal(x.to_string()))?;
+        let data = serde_json::to_string(&resp).expect("fail to serialize resp");
+        let mes = RaftMessage {
+            data,
+            error: "".to_string(),
+        };
+
+        Ok(tonic::Response::new(mes))
+    }
 }

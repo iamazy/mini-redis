@@ -40,7 +40,7 @@ anyhow = "1"
 async-trait = "0.1"
 prost = "0.7"
 tonic = "0.4"
-chrono = "0.4"
+petname = "1"
 
 [dev-dependencies]
 # Enable test-utilities in dev mode only. This is mostly for tests.

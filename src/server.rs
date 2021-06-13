@@ -5,6 +5,7 @@
 
 use crate::{Command, Connection, Db, Shutdown};
 
+use crate::raft::MiniRedisNode;
 use std::future::Future;
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
@@ -146,6 +147,10 @@ pub async fn run(listener: TcpListener, shutdown: impl Future) -> crate::Result<
         shutdown_complete_tx,
         shutdown_complete_rx,
     };
+
+    let addr = server.listener.local_addr()?;
+    let addr = format!("{}:{}", addr.ip().to_string(), addr.port());
+    let _ = MiniRedisNode::boot(0, addr).await?;
 
     // Concurrently run the server and listen for the `shutdown` signal. The
     // server task runs until an error is encountered, so under normal

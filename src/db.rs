@@ -4,8 +4,6 @@ use tokio::time::{self, Duration, Instant};
 use bytes::Bytes;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
-use chrono::{DateTime, Utc};
-use std::time::SystemTime;
 
 /// Server state shared across all connections.
 ///
@@ -19,15 +17,15 @@ use std::time::SystemTime;
 /// used to expire values after the requested duration has elapsed. The task
 /// runs until all instances of `Db` are dropped, at which point the task
 /// terminates.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default)]
 pub(crate) struct Db {
     /// Handle to shared state. The background task will also have an
     /// `Arc<Shared>`.
-    pub(crate) shared: Arc<Shared>,
+    shared: Arc<Shared>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub(crate) struct Shared {
+#[derive(Debug, Default)]
+struct Shared {
     /// The shared state is guarded by a mutex. This is a `std::sync::Mutex` and
     /// not a Tokio mutex. This is because there are no asynchronous operations
     /// being performed while holding the mutex. Additionally, the critical
@@ -40,23 +38,23 @@ pub(crate) struct Shared {
     /// operations), then the entire operation, including waiting for the mutex,
     /// is considered a "blocking" operation and `tokio::task::spawn_blocking`
     /// should be used.
-    pub(crate) state: Mutex<State>,
+    state: Mutex<State>,
 
     /// Notifies the background task handling entry expiration. The background
     /// task waits on this to be notified, then checks for expired values or the
     /// shutdown signal.
-    pub(crate) background_task: Notify,
+    background_task: Notify,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub(crate) struct State {
+#[derive(Debug, Default)]
+struct State {
     /// The key-value data. We are not trying to do anything fancy so a
     /// `std::collections::HashMap` works fine.
-    pub(crate) entries: HashMap<String, Entry>,
+    entries: HashMap<String, Entry>,
 
     /// The pub/sub key-space. Redis uses a **separate** key space for key-value
     /// and pub/sub. `mini-redis` handles this by using a separate `HashMap`.
-    pub(crate) pub_sub: HashMap<String, broadcast::Sender<Bytes>>,
+    pub_sub: HashMap<String, broadcast::Sender<Bytes>>,
 
     /// Tracks key TTLs.
     ///
@@ -68,30 +66,30 @@ pub(crate) struct State {
     /// created for the same instant. Because of this, the `Instant` is
     /// insufficient for the key. A unique expiration identifier (`u64`) is used
     /// to break these ties.
-    pub(crate) expirations: BTreeMap<(DateTime<Utc>, u64), String>,
+    expirations: BTreeMap<(Instant, u64), String>,
 
     /// Identifier to use for the next expiration. Each expiration is associated
     /// with a unique identifier. See above for why.
-    pub(crate) next_id: u64,
+    next_id: u64,
 
     /// True when the Db instance is shutting down. This happens when all `Db`
     /// values drop. Setting this to `true` signals to the background task to
     /// exit.
-    pub(crate) shutdown: bool,
+    shutdown: bool,
 }
 
 /// Entry in the key-value store
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub(crate) struct Entry {
+#[derive(Debug, Default)]
+struct Entry {
     /// Uniquely identifies this entry.
-    pub(crate) id: u64,
+    id: u64,
 
     /// Stored data
-    pub(crate) data: Vec<u8>,
+    data: Bytes,
 
     /// Instant at which the entry expires and should be removed from the
     /// database.
-    pub(crate) expires_at: Option<DateTime<Utc>>,
+    expires_at: Option<Instant>,
 }
 
 impl Db {
@@ -126,7 +124,7 @@ impl Db {
         // Because data is stored using `Bytes`, a clone here is a shallow
         // clone. Data is not copied.
         let state = self.shared.state.lock().unwrap();
-        state.entries.get(key).map(|entry| Bytes::from(entry.data.clone()))
+        state.entries.get(key).map(|entry| entry.data.clone())
     }
 
     /// Set the value associated with a key along with an optional expiration
@@ -150,7 +148,7 @@ impl Db {
 
         let expires_at = expire.map(|duration| {
             // `Instant` at which the key expires.
-            let when = DateTime::from(SystemTime::now() + duration);
+            let when = Instant::now() + duration;
 
             // Only notify the worker task if the newly inserted expiration is the
             // **next** key to evict. In this case, the worker needs to be woken up
@@ -170,7 +168,7 @@ impl Db {
             key,
             Entry {
                 id,
-                data: value.to_vec(),
+                data: value,
                 expires_at,
             },
         );
@@ -274,7 +272,7 @@ impl Drop for Db {
 impl Shared {
     /// Purge all expired keys and return the `Instant` at which the **next**
     /// key will expire. The background task will sleep until this instant.
-    fn purge_expired_keys(&self) -> Option<DateTime<Utc>> {
+    fn purge_expired_keys(&self) -> Option<Instant> {
         let mut state = self.state.lock().unwrap();
 
         if state.shutdown {
@@ -291,7 +289,7 @@ impl Shared {
         let state = &mut *state;
 
         // Find all keys scheduled to expire **before** now.
-        let now = DateTime::from(SystemTime::now());
+        let now = Instant::now();
 
         while let Some((&(when, id), key)) = state.expirations.iter().next() {
             if when > now {
@@ -318,7 +316,7 @@ impl Shared {
 }
 
 impl State {
-    fn next_expiration(&self) -> Option<DateTime<Utc>> {
+    fn next_expiration(&self) -> Option<Instant> {
         self.expirations
             .keys()
             .next()

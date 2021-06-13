@@ -21,7 +21,7 @@ message RaftMessage {
 service MiniRedisService {
 
   rpc Write(RaftMessage) returns (RaftMessage) {}
-  rpc Get(RaftMessage) returns (RaftMessage) {}
+  rpc Get(GetRequest) returns (GetResponse) {}
 
   rpc AppendEntries(RaftMessage) returns (RaftMessage);
   rpc InstallSnapshot(RaftMessage) returns (RaftMessage);

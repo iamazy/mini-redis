@@ -50,6 +50,7 @@ pub use buffer::{buffer, Buffer};
 mod shutdown;
 use shutdown::Shutdown;
 
+mod protobuf;
 mod raft;
 
 /// Default port that a redis server listens on.
