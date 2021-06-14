@@ -12,6 +12,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, mpsc, Semaphore};
 use tokio::time::{self, Duration};
 use tracing::{debug, error, info, instrument};
+use crate::config::GLOBAL_CONFIG;
 
 /// Server listener state. Created in the `run` call. It includes a `run` method
 /// which performs the TCP listening and initialization of per-connection state.
@@ -149,7 +150,8 @@ pub async fn run(listener: TcpListener, shutdown: impl Future) -> crate::Result<
     };
 
     let addr = server.listener.local_addr()?;
-    let addr = format!("{}:{}", addr.ip().to_string(), addr.port());
+    let port = GLOBAL_CONFIG.lock().unwrap().raft.port;
+    let addr = format!("{}:{}", addr.ip().to_string(), port);
     let _ = MiniRedisNode::boot(0, addr).await?;
 
     // Concurrently run the server and listen for the `shutdown` signal. The

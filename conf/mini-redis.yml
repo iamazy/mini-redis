@@ -1,0 +1,7 @@
+port: 6379
+raft:
+  id: 0
+  port: 4444
+  members:
+    - "localhost:4444"
+    - "localhost:6378"

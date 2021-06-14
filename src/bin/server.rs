@@ -6,11 +6,12 @@
 //!
 //! The `clap` crate is used for parsing arguments.
 
-use mini_redis::{server, DEFAULT_PORT};
+use mini_redis::{server, config, DEFAULT_PORT};
 
 use structopt::StructOpt;
 use tokio::net::TcpListener;
 use tokio::signal;
+use std::ops::Deref;
 
 #[tokio::main]
 pub async fn main() -> mini_redis::Result<()> {

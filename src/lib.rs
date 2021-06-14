@@ -52,6 +52,7 @@ use shutdown::Shutdown;
 
 mod protobuf;
 mod raft;
+pub mod config;
 
 /// Default port that a redis server listens on.
 ///
