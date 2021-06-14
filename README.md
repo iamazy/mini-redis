@@ -1,5 +1,7 @@
 # mini-redis
 
+> This repository adds [async-raft](https://github.com/async-raft/async-raft) support for distribution, refer to [datafuse](https://github.com/datafuselabs/datafuse)
+ 
 `mini-redis` is an incomplete, idiomatic implementation of a
 [Redis](https://redis.io) client and server built with
 [Tokio](https://tokio.rs).
