@@ -33,7 +33,7 @@ const ERR_INCONSISTENT_LOG: &str =
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct Context {
     #[serde(skip)]
-    pub(crate) db: Db,
+    pub db: Db,
     pub nodes: HashMap<NodeId, Node>,
 }
 
@@ -107,28 +107,27 @@ impl Display for Cmd {
     }
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
-pub struct RaftTxId {
-    pub client_id: String,
-    pub serial: u64,
-}
-
-impl RaftTxId {
-    pub fn new(client_id: &str, serial: u64) -> Self {
-        Self {
-            client_id: client_id.to_string(),
-            serial,
-        }
-    }
-}
-
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ClientRequest {
-    pub tx_id: Option<RaftTxId>,
+    /// The ID of the client which has set the request
+    pub client: String,
+    /// The serial number of this request
+    pub serial: u64,
     pub cmd: Cmd,
 }
 
 impl AppData for ClientRequest {}
+
+impl ClientRequest {
+
+    pub fn new_with_cmd(cmd: Cmd) -> ClientRequest {
+        ClientRequest {
+            client: "".to_string(),
+            serial: 0,
+            cmd
+        }
+    }
+}
 
 impl tonic::IntoRequest<RaftMessage> for ClientRequest {
     fn into_request(self) -> tonic::Request<RaftMessage> {
@@ -139,6 +138,7 @@ impl tonic::IntoRequest<RaftMessage> for ClientRequest {
         tonic::Request::new(mes)
     }
 }
+
 impl tonic::IntoRequest<RaftMessage> for AppendEntriesRequest<ClientRequest> {
     fn into_request(self) -> tonic::Request<RaftMessage> {
         let mes = RaftMessage {
@@ -148,6 +148,7 @@ impl tonic::IntoRequest<RaftMessage> for AppendEntriesRequest<ClientRequest> {
         tonic::Request::new(mes)
     }
 }
+
 impl tonic::IntoRequest<RaftMessage> for InstallSnapshotRequest {
     fn into_request(self) -> tonic::Request<RaftMessage> {
         let mes = RaftMessage {
@@ -157,6 +158,7 @@ impl tonic::IntoRequest<RaftMessage> for InstallSnapshotRequest {
         tonic::Request::new(mes)
     }
 }
+
 impl tonic::IntoRequest<RaftMessage> for VoteRequest {
     fn into_request(self) -> tonic::Request<RaftMessage> {
         let mes = RaftMessage {
@@ -206,6 +208,7 @@ impl From<ClientResponse> for RaftMessage {
         }
     }
 }
+
 impl From<RetryableError> for RaftMessage {
     fn from(err: RetryableError) -> Self {
         let error = serde_json::to_string(&err).expect("fail to serialize");
@@ -283,22 +286,19 @@ impl MemStoreStateMachine {
     #[tracing::instrument(level = "info", skip(self))]
     pub fn apply(&mut self, index: u64, data: &ClientRequest) -> anyhow::Result<ClientResponse> {
         self.last_applied_log = index;
-        if let Some(ref tx_id) = data.tx_id {
-            if let Some(ref tx_id) = data.tx_id {
-                if let Some((serial, response)) = self.client_serial_responses.get(&tx_id.client_id)
-                {
-                    if serial == &tx_id.serial {
-                        return Ok(response.clone());
-                    }
-                }
+        if let Some((serial, response)) = self.client_serial_responses.get(&data.client) {
+            if serial == &data.serial {
+                return Ok(response.clone());
             }
         }
         let resp = self.context.apply(data)?;
-        if let Some(ref tx_id) = data.tx_id {
             self.client_serial_responses
-                .insert(tx_id.client_id.clone(), (tx_id.serial, resp.clone()));
-        }
+                .insert(data.client.clone(), (data.serial, resp.clone()));
         Ok(resp)
+    }
+
+    pub fn get_db(&self) -> Db {
+        self.context.db.clone()
     }
 }
 
@@ -675,7 +675,7 @@ impl Network {
         Network { sto }
     }
 
-    #[tracing::instrument(level = "info", skip(self), fields(myid=self.sto.id))]
+    #[tracing::instrument(level = "info", skip(self), fields(myid = self.sto.id))]
     pub async fn make_client(
         &self,
         node_id: &NodeId,
@@ -690,7 +690,7 @@ impl Network {
 
 #[async_trait]
 impl RaftNetwork<ClientRequest> for Network {
-    #[tracing::instrument(level = "info", skip(self), fields(myid=self.sto.id))]
+    #[tracing::instrument(level = "info", skip(self), fields(myid = self.sto.id))]
     async fn append_entries(
         &self,
         target: u64,
@@ -707,7 +707,7 @@ impl RaftNetwork<ClientRequest> for Network {
         Ok(resp)
     }
 
-    #[tracing::instrument(level = "info", skip(self), fields(myid=self.sto.id))]
+    #[tracing::instrument(level = "info", skip(self), fields(myid = self.sto.id))]
     async fn install_snapshot(
         &self,
         target: u64,
@@ -726,7 +726,7 @@ impl RaftNetwork<ClientRequest> for Network {
         Ok(resp)
     }
 
-    #[tracing::instrument(level = "info", skip(self), fields(myid=self.sto.id))]
+    #[tracing::instrument(level = "info", skip(self), fields(myid = self.sto.id))]
     async fn vote(&self, target: u64, rpc: VoteRequest) -> Result<VoteResponse> {
         tracing::debug!("vote req to: id={} {:?}", target, rpc);
 
@@ -868,8 +868,8 @@ impl MiniRedisNode {
                     addr_str
                 );
             })
-            .await
-            .map_err(|e| anyhow::anyhow!("MiniRedisNode service error: {:?}", e))?;
+                .await
+                .map_err(|e| anyhow::anyhow!("MiniRedisNode service error: {:?}", e))?;
             Ok::<(), anyhow::Error>(())
         });
 
@@ -1047,30 +1047,22 @@ impl MiniRedisNode {
 
     #[tracing::instrument(level = "debug", skip(self))]
     pub async fn get_node(&self, node_id: &NodeId) -> Option<Node> {
-        // inconsistent get: from local state machine
-
         let sm = self.sto.sm.read().await;
         sm.context.get_node(node_id)
     }
 
-    /// Add a new node into this cluster.
-    /// The node info is committed with raft, thus it must be called on an initialized node.
     #[tracing::instrument(level = "debug", skip(self))]
     pub async fn add_node(&self, node_id: NodeId, addr: String) -> anyhow::Result<ClientResponse> {
-        // TODO: use tx_id?
-        let _resp = self
-            .write(ClientRequest {
-                tx_id: None,
-                cmd: Cmd::AddNode {
-                    node_id,
-                    node: Node {
-                        name: petname::petname(1, ""),
-                        address: addr,
-                    },
+        let resp = self
+            .write(ClientRequest::new_with_cmd(Cmd::AddNode {
+                node_id,
+                node: Node {
+                    name: addr.clone(),
+                    address: addr,
                 },
-            })
+            }))
             .await?;
-        Ok(_resp)
+        Ok(resp)
     }
 
     /// Submit a write request to the known leader. Returns the response after applying the request.

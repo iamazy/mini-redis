@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex};
 /// runs until all instances of `Db` are dropped, at which point the task
 /// terminates.
 #[derive(Debug, Clone, Default)]
-pub(crate) struct Db {
+pub struct Db {
     /// Handle to shared state. The background task will also have an
     /// `Arc<Shared>`.
     shared: Arc<Shared>,

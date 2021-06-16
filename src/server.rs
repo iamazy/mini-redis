@@ -139,20 +139,20 @@ pub async fn run(listener: TcpListener, shutdown: impl Future) -> crate::Result<
     let (notify_shutdown, _) = broadcast::channel(1);
     let (shutdown_complete_tx, shutdown_complete_rx) = mpsc::channel(1);
 
+    let addr = listener.local_addr()?;
+    let mini_redis_config = GLOBAL_CONFIG.lock().unwrap();
+    let addr = format!("{}:{}", addr.ip().to_string(), mini_redis_config.raft.port);
+    let redis_node = MiniRedisNode::boot(mini_redis_config.raft.id, addr).await?;
+
     // Initialize the listener state
     let mut server = Listener {
         listener,
-        db: Db::new(),
+        db: redis_node.sto.get_state_machine().await.get_db(),
         limit_connections: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
         notify_shutdown,
         shutdown_complete_tx,
         shutdown_complete_rx,
     };
-
-    let addr = server.listener.local_addr()?;
-    let port = GLOBAL_CONFIG.lock().unwrap().raft.port;
-    let addr = format!("{}:{}", addr.ip().to_string(), port);
-    let _ = MiniRedisNode::boot(0, addr).await?;
 
     // Concurrently run the server and listen for the `shutdown` signal. The
     // server task runs until an error is encountered, so under normal
@@ -247,7 +247,7 @@ impl Listener {
             // we manually add a new permit when processing completes.
             //
             // `acquire()` returns `Err` when the semaphore has been closed. We
-            // don't ever close the sempahore, so `unwrap()` is safe.
+            // don't ever close the semaphore, so `unwrap()` is safe.
             self.limit_connections.acquire().await.unwrap().forget();
 
             // Accept a new socket. This will attempt to perform error handling.

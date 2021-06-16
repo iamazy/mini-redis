@@ -20,6 +20,7 @@ pub struct MiniRedisConfig {
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct RaftConfig {
+    pub id: u64,
     pub port: u16,
     pub members: LinkedList<String>
 }
