@@ -15,6 +15,7 @@ pub static GLOBAL_CONFIG: Lazy<Mutex<MiniRedisConfig>> = Lazy::new(|| {
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct MiniRedisConfig {
+    pub port: u16,
     pub raft: RaftConfig
 }
 
