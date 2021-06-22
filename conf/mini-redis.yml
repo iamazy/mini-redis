@@ -4,4 +4,6 @@ raft:
   port: 4444
   members:
     - "localhost:4444"
-    - "localhost:6378"
+    - "localhost:5555"
+    - "localhost:6666"
+    - "localhost:7777"
