@@ -12,6 +12,7 @@ use structopt::StructOpt;
 use tokio::net::TcpListener;
 use tokio::signal;
 use std::ops::Deref;
+use mini_redis::config::GLOBAL_CONFIG;
 
 #[tokio::main]
 pub async fn main() -> mini_redis::Result<()> {
@@ -19,11 +20,8 @@ pub async fn main() -> mini_redis::Result<()> {
     // see https://docs.rs/tracing for more info
     tracing_subscriber::fmt::try_init()?;
 
-    let cli = Cli::from_args();
-    let port = cli.port.as_deref().unwrap_or(DEFAULT_PORT);
-
     // Bind a TCP listener
-    let listener = TcpListener::bind(&format!("127.0.0.1:{}", port)).await?;
+    let listener = TcpListener::bind(&format!("127.0.0.1:{}", GLOBAL_CONFIG.lock().unwrap().port)).await?;
 
     server::run(listener, signal::ctrl_c()).await
 }
